@@ -63,9 +63,9 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
-
+int krefcnt(void *pa);
 // log.c
-void            initlog(int, struct superblock*);
+void initlog(int, struct superblock *);
 void            log_write(struct buf*);
 void            begin_op(void);
 void            end_op(void);
@@ -174,8 +174,11 @@ int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int kaddrefcnt(void *pa);
+int cowpage(pagetable_t pagetable, uint64 va);
+void *cowalloc(pagetable_t pagetable, uint64 va);
+
 // plic.c
-void            plicinit(void);
+void plicinit(void);
 void            plicinithart(void);
 int             plic_claim(void);
 void            plic_complete(int);

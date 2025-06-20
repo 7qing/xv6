@@ -315,7 +315,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,24 +323,15 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    // if((mem = kalloc()) == 0)
-    //   goto err;
-    // memmove(mem, (char*)pa, PGSIZE);
-    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-    //   kfree(mem);
-    //   goto err;
-    // }
     if (flags & PTE_W) {
       flags = (flags | PTE_COW) & ~PTE_W;
       *pte = PA2PTE(pa) | flags;
-      if(kaddrefcnt((void*)pa) < 0){
-        panic("uvmcopy: kaddrefcnt failed");
-      }
     }
     if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
-      kfree(mem);
+      uvmunmap(new, 0, i / PGSIZE, 1);
       goto err;
     }
+    kaddrefcnt((void *)pa);
   }
   return 0;
 
@@ -370,17 +360,17 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-  pte_t *pte;
-
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    if(va0 >= MAXVA)
+    pa0 = walkaddr(pagetable, va0);
+
+
+    if (cowpage(pagetable, va0) == 0) {
+      pa0 = (uint64)cowalloc(pagetable, va0);
+    }
+
+    if(pa0 ==0)
       return -1;
-    pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
-      return -1;
-    pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -458,5 +448,54 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return 0;
   } else {
     return -1;
+  }
+}
+
+//  cowpage 判断一个页面是否为COW页面
+int cowpage(pagetable_t pagetable, uint64 va) {
+  if (va >= MAXVA)
+    return -1;
+  pte_t *pte = walk(pagetable, va, 0);
+  if (pte == 0)
+    return -1;
+  if ((*pte & PTE_V) == 0)
+    return -1;
+  return (*pte & PTE_COW ? 0 : -1);
+}
+
+void *cowalloc(pagetable_t pagetable, uint64 va) {
+  if (va % PGSIZE != 0)
+    return 0;
+
+  uint64 pa = walkaddr(pagetable, va); // 获取对应的物理地址
+  if (pa == 0)
+    return 0;
+
+  pte_t *pte = walk(pagetable, va, 0); // 获取对应的PTE
+
+  if (krefcnt((char *)pa) == 1) {
+    // 只剩一个进程对此物理地址存在引用
+    *pte |= PTE_W;
+    *pte &= ~PTE_COW;
+    return (void *)pa;
+  } else {
+    // 多个进程对物理内存存在引用
+    char *mem = kalloc();
+    if (mem == 0)
+      return 0;
+
+    memmove(mem, (char *)pa, PGSIZE);
+
+    *pte &= ~PTE_V;
+
+    if (mappages(pagetable, va, PGSIZE, (uint64)mem,
+                 (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW) != 0) {
+      kfree(mem);
+      *pte |= PTE_V;
+      return 0;
+    }
+
+    kfree((char *)PGROUNDDOWN(pa));
+    return mem;
   }
 }
