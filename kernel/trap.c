@@ -46,10 +46,10 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
 
@@ -77,9 +77,15 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
-
+  if(which_dev == 2){
+    p->ticks++;
+    if (p->ticks == p->interval && 0 < p->interval) {
+      *(p->pre_trapframe) = *(p->trapframe); // save the trapframe
+      p->trapframe->epc = p->handler;
+    } else {
+      yield();
+    }
+  }
   usertrapret();
 }
 
