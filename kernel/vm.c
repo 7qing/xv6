@@ -324,10 +324,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    //   kfree(mem);
+    //   goto err;
+    // }
+    if (flags & PTE_W) {
+      flags = (flags | PTE_COW) & ~PTE_W;
+      *pte = PA2PTE(pa) | flags;
+      if(kaddrefcnt((void*)pa) < 0){
+        panic("uvmcopy: kaddrefcnt failed");
+      }
+    }
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       kfree(mem);
       goto err;
     }
