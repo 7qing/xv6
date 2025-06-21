@@ -101,8 +101,28 @@ e1000_transmit(char *buf, int len)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after send completes.
   //
+  //printf("e1000_transmit: %d bytes\n", len);
+  acquire(&e1000_lock);
+  uint32 idx = regs[E1000_TDT];
+  struct tx_desc *desc = &tx_ring[idx];
+  if((desc->status & E1000_TXD_STAT_DD) == 0) {
+    // TX descriptor not ready, return -1
+    release(&e1000_lock);
+    return -1;
+  }
+  if (tx_bufs[idx])
+    kfree(tx_bufs[idx]);
+  desc->addr = (uint64)buf;
+  desc->length = len;
+  desc->cmd = E1000_TXD_CMD_RS | E1000_TXD_CMD_EOP; // report status, end of packet
+  tx_bufs[idx] = buf;
 
-  
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  // wait for the e1000 to finish sending the packet
+  __sync_synchronize();
+
+  release(&e1000_lock);
   return 0;
 }
 
@@ -115,7 +135,33 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver a buf for each packet (using net_rx()).
   //
+ // printf("e1000_recv: checking for packets\n");
+  int idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+  struct rx_desc *desc = &rx_ring[idx];
 
+  while (desc->status & E1000_RXD_STAT_DD) {
+    acquire(&e1000_lock);
+
+    char *buf = rx_bufs[idx];
+
+    
+
+    rx_bufs[idx] = kalloc();
+    if (!rx_bufs[idx])
+      panic("buf alloc failed");
+    desc->addr = (uint64)rx_bufs[idx];
+    desc->status = 0;
+
+    regs[E1000_RDT] = idx;
+    __sync_synchronize();
+
+    release(&e1000_lock);
+
+    net_rx(buf, desc->length);
+
+    idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    desc = &rx_ring[idx];
+  }
 }
 
 void

@@ -19,10 +19,34 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+#define MAX_BOUND_PORTS 16
+
+struct udp_packet {
+  struct udp_packet *next;
+  uint32 src_ip;
+  uint16 sport;
+  int len;
+  char *data;
+};
+
+struct bound_port {
+  int active;
+  int port;
+  struct udp_packet *head;
+  struct udp_packet *tail;
+};
+
+struct bound_port bound_ports[MAX_BOUND_PORTS];
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+  for (int i = 0; i < MAX_BOUND_PORTS; i++) {
+    bound_ports[i].active = 0;
+    bound_ports[i].head = 0;
+    bound_ports[i].tail = 0;
+  }
 }
 
 
@@ -37,8 +61,35 @@ sys_bind(void)
   //
   // Your code here.
   //
+  int port;
+  argint(0, &port);
 
-  return -1;
+  acquire(&netlock);
+  for (int i = 0; i < MAX_BOUND_PORTS; i++) {
+    if (bound_ports[i].active && bound_ports[i].port == port) {
+      release(&netlock);
+      return -1;
+    }
+  }
+
+  int i;
+  for (i = 0; i < MAX_BOUND_PORTS; i++) {
+    if (!bound_ports[i].active) {
+      break;
+    }
+  }
+  if (i == MAX_BOUND_PORTS) {
+    release(&netlock);
+    return -1;
+  }
+
+  bound_ports[i].active = 1;
+  bound_ports[i].port = port;
+  bound_ports[i].head = 0;
+  bound_ports[i].tail = 0;
+
+  release(&netlock);
+  return 0;
 }
 
 //
@@ -52,7 +103,28 @@ sys_unbind(void)
   //
   // Optional: Your code here.
   //
-
+  int port;
+  argint(0, &port);
+  acquire(&netlock);
+  for (int i = 0; i < MAX_BOUND_PORTS; i++) {
+    if (bound_ports[i].active && bound_ports[i].port == port) {
+      // Free all queued packets
+      struct udp_packet *pkt = bound_ports[i].head;
+      while (pkt) {
+        struct udp_packet *next = pkt->next;
+        kfree(pkt->data);
+        kfree(pkt);
+        pkt = next;
+      }
+      bound_ports[i].active = 0;
+      bound_ports[i].head = 0;
+      bound_ports[i].tail = 0;
+      release(&netlock);
+      return 0;
+    }
+  }
+  release(&netlock);
+  return -1;
   return 0;
 }
 
@@ -77,7 +149,59 @@ sys_recv(void)
   //
   // Your code here.
   //
-  return -1;
+  struct proc *p = myproc();
+  int dport;
+  uint64 src_ptr, sport_ptr, bufaddr;
+  int maxlen;
+
+  argint(0, &dport);
+  argaddr(1, &src_ptr);
+  argaddr(2, &sport_ptr);
+  argaddr(3, &bufaddr);
+  argint(4, &maxlen);
+
+  acquire(&netlock);
+
+  struct bound_port *port = 0;
+  for (int i = 0; i < MAX_BOUND_PORTS; i++) {
+    if (bound_ports[i].active && bound_ports[i].port == dport) {
+      port = &bound_ports[i];
+      break;
+    }
+  }
+  if (!port) {
+    release(&netlock);
+    return -1;
+  }
+
+  // Wait for packet
+  while (port->head == 0) {
+    sleep(&port->head, &netlock);
+  }
+
+  struct udp_packet *pkt = port->head;
+  port->head = pkt->next;
+  if (!port->head)
+    port->tail = 0;
+  release(&netlock);
+
+  // Copy out source IP and port
+  uint32 src_ip = pkt->src_ip;
+  uint16 sport = pkt->sport;
+  int len = pkt->len;
+  int n = len > maxlen ? maxlen : len;
+
+  if (copyout(p->pagetable, src_ptr, (char *)&src_ip, sizeof(src_ip)) < 0 ||
+      copyout(p->pagetable, sport_ptr, (char *)&sport, sizeof(sport)) < 0 ||
+      copyout(p->pagetable, bufaddr, pkt->data, n) < 0) {
+    kfree(pkt->data);
+    kfree(pkt);
+    return -1;
+  }
+
+  kfree(pkt->data);
+  kfree(pkt);
+  return n;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -191,7 +315,79 @@ ip_rx(char *buf, int len)
   //
   // Your code here.
   //
-  
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+
+  // Check destination IP
+  if (ip->ip_dst != htonl(local_ip)) {
+    kfree(buf);
+    return;
+  }
+
+  if (ip->ip_p == IPPROTO_UDP) {
+    struct udp *udp = (struct udp *)(ip + 1); // IP header is 20 bytes
+    uint16 ulen = ntohs(udp->ulen);
+    if (ulen < sizeof(struct udp) ||
+        ntohs(ip->ip_len) < sizeof(struct ip) + ulen) {
+      kfree(buf);
+      return;
+    }
+
+    uint16 dport = ntohs(udp->dport);
+    uint16 sport = ntohs(udp->sport);
+    uint32 src_ip = ntohl(ip->ip_src);
+    int payload_len = ulen - sizeof(struct udp);
+    char *payload = (char *)(udp + 1);
+
+    acquire(&netlock);
+    // Find bound port
+    struct bound_port *port = 0;
+    for (int i = 0; i < MAX_BOUND_PORTS; i++) {
+      if (bound_ports[i].active && bound_ports[i].port == dport) {
+        port = &bound_ports[i];
+        break;
+      }
+    }
+
+    if (!port) {
+      release(&netlock);
+      kfree(buf);
+      return;
+    }
+
+    // Allocate and fill packet
+    struct udp_packet *pkt = kalloc();
+    if (!pkt)
+      goto fail;
+    pkt->src_ip = src_ip;
+    pkt->sport = sport;
+    pkt->len = payload_len;
+    pkt->data = kalloc();
+    if (!pkt->data) {
+      kfree(pkt);
+      goto fail;
+    }
+    memmove(pkt->data, payload, payload_len);
+    pkt->next = 0;
+
+    // Enqueue packet
+    if (port->tail) {
+      port->tail->next = pkt;
+      port->tail = pkt;
+    } else {
+      port->head = port->tail = pkt;
+    }
+    wakeup(&port->head);
+    release(&netlock);
+    kfree(buf);
+    return;
+
+  fail:
+    release(&netlock);
+    kfree(buf);
+  } else {
+    kfree(buf);
+  }
 }
 
 //
