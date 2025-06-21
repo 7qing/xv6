@@ -1,3 +1,5 @@
+
+
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -67,21 +69,41 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 13) {
+    if (killed(p))
+      exit(-1);
+    int i;
+    uint64 va = r_stval();
+    if (va > MAXVA)
+      panic("mmap:out of mem");
+
+    printf("mmap fault va = %p\n", (void *)va);
+
+    for (i = 0; i < NMMAPVMA; i++) {
+      if (p->mmap[i].vaild == 1 && p->mmap[i].addr <= va &&
+          va < (p->mmap[i].addr + p->mmap[i].len))
+        break;
+    }
+    if (p->mmap[i].vaild == 0 && p->mmap[i].addr == 0)
+      panic("mmap_fault");
+    if (mmap_fault(p->pagetable, (uint64)&p->mmap[i]) < 0)
+      p->killed = 1;
   } else {
+    //      error:
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
 
-  if(killed(p))
-    exit(-1);
+    if (killed(p))
+      exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+    // give up the CPU if this is a timer interrupt.
+    if (which_dev == 2)
+      yield();
 
-  usertrapret();
-}
+    usertrapret();
+  }
 
 //
 // return to user space

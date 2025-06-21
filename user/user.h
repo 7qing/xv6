@@ -1,7 +1,8 @@
 #ifdef LAB_MMAP
-typedef unsigned long size_t;
-typedef long int off_t;
+
 #endif
+typedef unsigned long int   size_t;
+typedef int                 off_t;  
 struct stat;
 
 // system calls
@@ -37,6 +38,8 @@ int ugetpid(void);
 uint64 pgpte(void*);
 void kpgtbl(void);
 #endif
+void *mmap(void *, int, int, int,int, off_t);
+int munmap(void *, size_t);
 
 // ulib.c
 int stat(const char*, struct stat*);

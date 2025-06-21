@@ -15,6 +15,8 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"  // for TRAPFRAME definition
+
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -502,4 +504,177 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64 find_freespace(struct vm_area m[], uint64 len) {
+  uint64 top = TRAPFRAME, bottom = TRAPFRAME - len;
+  int i;
+  for (i = 0; i < NMMAPVMA; i++) {
+    if (m[i].vaild == 0)
+      continue;
+    if (top <= (m[i].addr + m[i].len) || bottom <= m[i].addr) {
+      top = m[i].addr;
+      bottom = top - len;
+    }
+  }
+
+  return bottom;
+}
+
+uint64 sys_mmap(void) {
+  uint64 addr, len;
+  int prot, flags, fd, off;
+  struct file *f;
+
+  if (argfd(4, &fd, &f) < 0)
+    return -1;
+
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(5, &off);
+
+  // open是以只读形式打开文件的时候，
+  // mmap以MAP_SHARED和PROT_WRITE方式进行映射是会出现错误的，在
+  if (f->writable == O_RDONLY && (prot & PROT_WRITE) && (flags & MAP_SHARED))
+    return -1;
+
+  struct proc *p = myproc();
+  uint64 va;
+
+  if (addr == 0) {
+    struct vm_area *empty = 0;
+    int i;
+    for (i = 0; i < NMMAPVMA; i++) {
+      if (p->mmap[i].vaild == 0) {
+        empty = &p->mmap[i];
+        break;
+      }
+    }
+
+    if (empty == 0)
+      panic("mmap");
+
+    if ((va = find_freespace(p->mmap, len)) == 0)
+      panic("mmap 2");
+
+    // 初始化VMA
+    empty->vaild = 1;
+    empty->f = f;
+    empty->flags = flags;
+    empty->len = len;
+    empty->off = off;
+    empty->perm = prot << 1 | PTE_U;
+    empty->addr = va;
+
+    filedup(empty->f);
+
+    return empty->addr;
+  }
+
+  return -1;
+}
+
+int mmap_fault(pagetable_t pt, uint64 mmap) {
+  int r, i;
+  struct vm_area *m = (struct vm_area *)mmap;
+  struct file *f = m->f;
+
+  uint64 pa, tva = m->addr + m->off;
+
+  uint roff = m->off; // m->off开始读取inode数据
+
+  m->mapped = 1;
+
+  for (i = 0; i < m->len && tva < (m->addr + m->len); i += PGSIZE) {
+    // 分配内存地址，可能不是连续的，因此可以一页一页的分配，并建立映射
+    if ((pa = (uint64)kalloc()) == 0)
+      return -1;
+
+    memset((void *)pa, 0, PGSIZE);
+
+    // 将文件内容拷贝到内核区
+    ilock(f->ip);
+    if ((r = readi(f->ip, 0, pa, roff, PGSIZE)) > 0)
+      roff += r; // write已经修改了文件的off字段，
+                 // 再使用off读取会导致读取不到数据
+    iunlock(f->ip);
+
+    // 建立映射
+    if (mappages(pt, tva, PGSIZE, pa, m->perm) != 0) {
+      kfree((void *)pa);
+      return -1;
+    }
+
+    tva += PGSIZE;
+  }
+  return 0;
+}
+
+uint64 sys_munmap(void) {
+  uint64 va, len;
+
+  argaddr(0, &va);
+  argaddr(1, &len);
+
+  struct proc *p = myproc();
+  struct vm_area *m = 0;
+
+  int i;
+  for (i = 0; i < NMMAPVMA; i++) {
+    if (p->mmap[i].vaild == 1 && p->mmap[i].addr <= va &&
+        va < p->mmap[i].addr + p->mmap[i].len) {
+      m = &p->mmap[i];
+      break;
+    }
+  }
+
+  if (m == 0)
+    return -1;
+
+  if ((m->len - len) <= 0) {
+
+    if (m->flags & MAP_SHARED) {
+      begin_op();
+      ilock(m->f->ip);
+      if (writei(m->f->ip, 1, va, 0, m->len) != m->len)
+        panic("writei");
+      iunlock(m->f->ip);
+      end_op();
+    }
+
+    m->f->ref--;
+    m->f->off = 0;
+    // off以上是已经分配的虚拟页
+    uvmunmap(p->pagetable, va, len / PGSIZE, 1);
+
+    memset((void *)m, 0, sizeof(struct vm_area));
+
+    return 0;
+  } else {
+
+    if (m->flags & MAP_SHARED) {
+      begin_op();
+      ilock(m->f->ip);
+      if (writei(m->f->ip, 1, va, 0, len) != len)
+        panic("writei");
+      iunlock(m->f->ip);
+      end_op();
+    }
+    if (va != m->addr) {
+      // 防止虚拟内存区域出现漏洞
+      len = m->len - (va - m->addr);
+      uvmunmap(p->pagetable, va, len / PGSIZE, 1);
+      m->len = m->len - len;
+    } else {
+      uvmunmap(p->pagetable, va, len / PGSIZE, 1);
+      m->len -= PGROUNDUP(len);
+      m->addr += PGROUNDUP(len);
+    }
+
+    return 0;
+  }
+
+  return -1;
 }

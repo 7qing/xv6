@@ -3,8 +3,15 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
+
+
+
 #include "proc.h"
+
+
+
 #include "defs.h"
+
 
 struct cpu cpus[NCPU];
 
@@ -146,6 +153,12 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  int i;
+  for (i = 0; i < NMMAPVMA; i++) {
+    p->mmap[i].vaild = 0;
+    p->mmap[i].mapped = 0;
+    p->mmap[i].addr = 0;
+  }
   return p;
 }
 
@@ -312,6 +325,13 @@ fork(void)
 
   pid = np->pid;
 
+  // 拷贝映射区
+  for(i = 0; i < NMMAPVMA ;i++){
+    if(p->mmap[i].vaild){
+      filedup(p->mmap[i].f);
+      np->mmap[i] = p->mmap[i];
+    }
+  }
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -343,6 +363,7 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
+#define MAP_SHARED 0x01
 void
 exit(int status)
 {
@@ -350,6 +371,11 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // 释放和写回 mmap 数据需要在关闭文件之前
+  for(int i = 0;i < NMMAPVMA;i++){
+    if(p->mmap[i].vaild && p->mmap[i].mapped)
+      uvmunmap(p->pagetable,p->mmap[i].addr,p->mmap[i].len/PGSIZE,1);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
@@ -383,6 +409,7 @@ exit(int status)
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
+  }
 }
 
 // Wait for a child process to exit and return its pid.
