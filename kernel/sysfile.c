@@ -323,6 +323,10 @@ sys_open(void)
       return -1;
     }
   } else {
+    if ((ip = getip(path, 0, omode)) == 0) {
+      end_op();
+      return -1;
+    }
     if((ip = namei(path)) == 0){
       end_op();
       return -1;
@@ -502,4 +506,57 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64 sys_symlink(void) {
+  char path[MAXPATH], target[MAXPATH];
+
+  struct inode *ip;
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  begin_op();
+  if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
+    end_op();
+    return -1;
+  }
+
+  if (writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+
+  return 0;
+}
+#define O_CREATE 0x200
+
+#define O_TRUNC 0x400
+
+#define O_NOFOLLOW 0x800
+
+struct inode *getip(char *path, int depth, int omode) {
+  if (depth > 10) {
+    return 0;
+  }
+  struct inode *ip;
+  ip = namei(path);
+  if (ip == 0) {
+    return 0;
+  }
+
+  ilock(ip);
+
+  if (!(omode & O_NOFOLLOW) && ip->type == T_SYMLINK) {
+    char next[MAXPATH];
+    if (readi(ip, 0, (uint64)next, 0, MAXPATH) == 0) {
+      iunlockput(ip);
+      return 0;
+    }
+    iunlockput(ip);
+    return getip(next, depth + 1, omode);
+  }
+  iunlock(ip);
+  return ip;
 }
